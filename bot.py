@@ -9,7 +9,8 @@ from pyrogram.types import Message, BotCommand
 from pyrogram.errors import FloodWait, RPCError
 from config import API_ID, API_HASH, BOT_TOKEN, LOG_CHANNEL, ADMINS
 from database.db import db
-from logger import LOGGER
+import log
+from log import LOGGER, setup_telegram_logging, stop_telegram_logging
 
 logger = LOGGER(__name__)
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -79,9 +80,12 @@ class Bot(Client):
                 logger.error(f"Critical Startup Error: {e}")
                 await asyncio.sleep(15)
 
+        # 3. Activate pyrogram → Telegram log forwarding
+        setup_telegram_logging(self)
+
         me = await self.get_me()
 
-        # 3. DB Stats
+        # 4. DB Stats
         try:
             user_count = await db.total_users_count()
             logger.info(f"MongoDB Connected: {user_count} users found.")
@@ -89,7 +93,7 @@ class Bot(Client):
             logger.error(f"DB stats failed: {e}")
             user_count = "Unknown"
 
-        # 4. Startup notification
+        # 5. Startup notification
         now = datetime.datetime.now(IST)
         startup_text = (
             f"<b><i>🤖 Bot Successfully Started ♻️</i></b>\n\n"
@@ -108,6 +112,9 @@ class Bot(Client):
         await self.set_bot_commands_list()
 
     async def stop(self, *args):
+        # Stop pyrogram → Telegram log forwarding before shutting down
+        stop_telegram_logging()
+
         try:
             await self.send_message(LOG_CHANNEL, "<b><i>❌ Bot is going Offline</i></b>")
         except:
