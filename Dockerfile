@@ -18,10 +18,14 @@ ENV PYTHONUNBUFFERED=1
 # Set working directory
 WORKDIR /app
 
-# Install minimal system dependencies
+# Install system dependencies including ffmpeg and ffprobe
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
+
+# Verify ffmpeg and ffprobe installation
+RUN ffmpeg -version && ffprobe -version
 
 # Install Python dependencies
 COPY requirements.txt .
@@ -29,6 +33,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy project files
 COPY . .
+
+# Create necessary directories
+RUN mkdir -p downloads temp_thumbs
 
 # Start ONLY the bot
 # Flask keep_alive server handles port binding
