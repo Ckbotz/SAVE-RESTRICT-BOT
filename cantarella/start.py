@@ -59,6 +59,42 @@ if (
     raise Exception("Tampered developer info detected! Bot will not start. Fuck the code - crashing now.")
 
 
+# ===========================================================================
+# Custom exception for cancellation (ported from Code 1)
+# ===========================================================================
+
+class ProcessCancelled(Exception):
+    """Raised when the user cancels an ongoing task."""
+    pass
+
+
+# ===========================================================================
+# Task registry — supports both private chats and groups
+# Each active task is keyed by "user_id:chat_id" so multiple users in
+# different groups can run independently (same approach as Code 1).
+# ===========================================================================
+
+class batch_temp(object):
+    IS_BATCH      = {}   # True  → no active task (slot is free)
+                         # False → task is running
+    CANCEL_TASKS  = {}   # True  → cancellation requested
+    DOWNLOAD_TASKS = {}  # asyncio.Task references for in-flight downloads
+    ACTIVE_SESSIONS = {} # reusable pyrogram Client objects per user
+
+
+def get_task_key(user_id: int, chat_id: int) -> str:
+    """
+    Build a unique task key for (user, chat) pair.
+    • Private chat  → user_id == chat_id  → "uid:uid"  (backward-compat)
+    • Group / super → different ids        → "uid:cid"
+    """
+    return f"{user_id}:{chat_id}"
+
+
+# ===========================================================================
+# Script strings
+# ===========================================================================
+
 class script(object):
 
     START_TXT = """<b>👋 Hello {},</b>
@@ -91,6 +127,9 @@ class script(object):
 <blockquote><b>🕐 Batch Sleep Settings:</b></blockquote>
 • Use <code>/setsleep 3 5 7 10</code> to set custom delay between downloads.
 • Use <code>/getsleep</code> to view your current sleep settings.
+<blockquote><b>👥 Group Support:</b></blockquote>
+• Send a Telegram link directly in any group where the bot is a member.
+• <code>/cancel</code> and <code>/setsleep</code> work in groups too!
 """
     ABOUT_TXT = """<b>ℹ️ About This Bot</b>
 <blockquote><b>╭────[ 🧩 Technical Stack ]────⍟</b>
@@ -144,10 +183,14 @@ Download files up to 4GB and beyond with no limits!
 """
 
 
+# ===========================================================================
+# Helpers
+# ===========================================================================
+
 def humanbytes(size):
     if not size:
         return "0B"
-    power = 2**10
+    power = 2 ** 10
     n = 0
     Dic_powerN = {0: ' ', 1: 'K', 2: 'M', 3: 'G', 4: 'T'}
     while size > power:
@@ -162,123 +205,152 @@ def TimeFormatter(milliseconds: int) -> str:
     hours, minutes = divmod(minutes, 60)
     days, hours = divmod(hours, 24)
     tmp = ((str(days) + "d, ") if days else "") + \
-        ((str(hours) + "h, ") if hours else "") + \
-        ((str(minutes) + "m, ") if minutes else "") + \
-        ((str(seconds) + "s, ") if seconds else "")
+          ((str(hours) + "h, ") if hours else "") + \
+          ((str(minutes) + "m, ") if minutes else "") + \
+          ((str(seconds) + "s, ") if seconds else "")
     return tmp[:-2] if tmp else "0s"
 
 
-class batch_temp(object):
-    IS_BATCH = {}
-
-
 def get_message_type(msg):
-    if getattr(msg, 'document', None): return "Document"
-    if getattr(msg, 'video', None): return "Video"
-    if getattr(msg, 'photo', None): return "Photo"
-    if getattr(msg, 'audio', None): return "Audio"
-    if getattr(msg, 'text', None): return "Text"
+    if getattr(msg, 'document', None):  return "Document"
+    if getattr(msg, 'video', None):     return "Video"
+    if getattr(msg, 'photo', None):     return "Photo"
+    if getattr(msg, 'audio', None):     return "Audio"
+    if getattr(msg, 'text', None):      return "Text"
     return None
 
 
-# =====================================================================
-# Core download logic — UNTOUCHED from Code 1
-# =====================================================================
+# ===========================================================================
+# Progress callback — async, inline edits the status message directly.
+# Attaches a 🛑 Cancel inline button carrying the task_key so it works in
+# both private chats and groups.
+# ===========================================================================
 
-async def downstatus(client, statusfile, message, chat):
-    while not os.path.exists(statusfile):
-        await asyncio.sleep(3)
-    while os.path.exists(statusfile):
-        try:
-            with open(statusfile, "r", encoding='utf-8') as downread:
-                txt = downread.read()
-            await client.edit_message_text(chat, message.id, f"{txt}")
-            await asyncio.sleep(5)
-        except:
-            await asyncio.sleep(5)
+UPDATE_DELAY = 5   # seconds between progress message edits
 
+async def progress_callback(current, total, smsg, mode, start_time, task_key):
+    """
+    Async progress callback compatible with pyrogram's download_media /
+    send_* progress_args.
 
-async def upstatus(client, statusfile, message, chat):
-    while not os.path.exists(statusfile):
-        await asyncio.sleep(3)
-    while os.path.exists(statusfile):
-        try:
-            with open(statusfile, "r", encoding='utf-8') as upread:
-                txt = upread.read()
-            await client.edit_message_text(chat, message.id, f"{txt}")
-            await asyncio.sleep(5)
-        except:
-            await asyncio.sleep(5)
+    Parameters
+    ----------
+    current   : bytes transferred so far
+    total     : total bytes
+    smsg      : the status Message object to edit in-place
+    mode      : "download" | "upload"
+    start_time: time.time() when the transfer started
+    task_key  : "user_id:chat_id" string for cancel checks
+    """
+    if smsg is None:
+        return
 
-
-def progress(current, total, message, type):
-    if batch_temp.IS_BATCH.get(message.from_user.id):
-        raise Exception("Cancelled")
-    if not hasattr(progress, "cache"):
-        progress.cache = {}
+    # Fast-path cancel check (no await needed)
+    if batch_temp.CANCEL_TASKS.get(task_key, False):
+        raise ProcessCancelled("Cancelled by user")
 
     now = time.time()
-    task_id = f"{message.id}{type}"
-    last_time = progress.cache.get(task_id, 0)
+    cache_attr = f"_last_edit_{smsg.id}"
+    last_edit = getattr(progress_callback, cache_attr, 0)
+    if now - last_edit < UPDATE_DELAY and current != total:
+        return
+    setattr(progress_callback, cache_attr, now)
 
-    if not hasattr(progress, "start_time"):
-        progress.start_time = {}
-    if task_id not in progress.start_time:
-        progress.start_time[task_id] = now
+    diff = now - start_time
+    percentage = (current / total * 100) if total else 0
+    speed = current / diff if diff > 0 else 0
+    eta = (total - current) / speed if speed > 0 else 0
 
-    if (now - last_time) > 5 or current == total:
-        try:
-            percentage = current * 100 / total
-            speed = current / (now - progress.start_time[task_id]) if (now - progress.start_time[task_id]) > 0 else 0
-            eta = (total - current) / speed if speed > 0 else 0
-            elapsed = now - progress.start_time[task_id]
+    filled = int(percentage / 5)
+    bar = '█' * filled + ' ' * (20 - filled)
 
-            filled_length = int(percentage / 5)
-            bar = '█' * filled_length + ' ' * (20 - filled_length)
+    status_emoji = "📥" if mode == "download" else "📤"
+    status_label = "Downloading" if mode == "download" else "Uploading"
 
-            status = script.PROGRESS_BAR.format(
-                bar=bar,
-                percentage=percentage,
-                current=humanbytes(current),
-                total=humanbytes(total),
-                speed=humanbytes(speed),
-                elapsed=TimeFormatter(elapsed * 1000),
-                eta=TimeFormatter(eta * 1000)
-            )
+    text = (
+        f"<b>⚡ {status_emoji} {status_label}...</b>\n"
+        f"<blockquote>\n"
+        f"<b>Progress: [{bar}] {percentage:.1f}%</b>\n"
+        f"<b>🚀 Speed:</b> <code>{humanbytes(speed)}/s</code>\n"
+        f"<b>💾 Size:</b> <code>{humanbytes(current)} of {humanbytes(total)}</code>\n"
+        f"<b>⏱ Elapsed:</b> <code>{TimeFormatter(diff * 1000)}</code>\n"
+        f"<b>⏳ ETA:</b> <code>{TimeFormatter(eta * 1000)}</code>\n"
+        f"</blockquote>"
+    )
 
-            with open(f'{message.id}{type}status.txt', "w", encoding='utf-8') as fileup:
-                fileup.write(status)
+    cancel_markup = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🛑 Cancel", callback_data=f"cancel_{task_key}")
+    ]])
 
-            progress.cache[task_id] = now
-
-            if current == total:
-                progress.start_time.pop(task_id, None)
-                progress.cache.pop(task_id, None)
-        except:
-            pass
+    try:
+        await smsg.edit_text(text, reply_markup=cancel_markup, parse_mode=enums.ParseMode.HTML)
+    except Exception:
+        pass
 
 
-# =====================================================================
-# Command handlers
-# =====================================================================
+# ===========================================================================
+# Cancel callback — handles both "cancel_uid" and "cancel_uid:cid" formats
+# ===========================================================================
 
-@Client.on_message(filters.command(["start"]))
+@Client.on_callback_query(filters.regex(r"^cancel_"))
+async def cancel_callback(client: Client, callback_query: CallbackQuery):
+    data     = callback_query.data          # "cancel_<payload>"
+    payload  = data[len("cancel_"):]        # "<user_id>" or "<user_id>:<chat_id>"
+
+    if ":" in payload:
+        user_id  = int(payload.split(":", 1)[0])
+        task_key = payload
+    else:
+        user_id  = int(payload)
+        task_key = payload
+
+    # Only the owner of the task may cancel it
+    if callback_query.from_user.id != user_id:
+        await callback_query.answer("⚠️ This is not your process!", show_alert=True)
+        return
+
+    batch_temp.CANCEL_TASKS[task_key] = True
+    batch_temp.IS_BATCH[task_key]     = True   # mark slot as free so next task can start
+
+    # Cancel in-flight download asyncio.Task if registered
+    task = batch_temp.DOWNLOAD_TASKS.get(task_key)
+    if task and not task.done():
+        task.cancel()
+
+    await callback_query.answer("🛑 Cancelling…", show_alert=True)
+    try:
+        await callback_query.message.edit_text(
+            "<b>🛑 Cancellation In Progress</b>\n\n"
+            "⚠️ Stopping current operation…\n"
+            "⚠️ Cleaning up temporary files…",
+            parse_mode=enums.ParseMode.HTML
+        )
+    except Exception:
+        pass
+
+
+# ===========================================================================
+# /start  — private + group
+# ===========================================================================
+
+@Client.on_message(filters.command(["start"]) & (filters.private | filters.group))
 async def send_start(client: Client, message: Message):
     if not await db.is_user_exist(message.from_user.id):
         await db.add_user(message.from_user.id, message.from_user.first_name)
     try:
         await message.react(emoji=random.choice(REACTIONS), big=True)
-    except:
+    except Exception:
         pass
+
     apis = ["https://api.waifu.pics/sfw/waifu", "https://nekos.life/api/v2/img/waifu"]
-    api_url = random.choice(apis)
     try:
-        response = requests.get(api_url)
+        response = requests.get(random.choice(apis))
         response.raise_for_status()
         photo_url = response.json()["url"]
     except Exception as e:
         logger.error(f"Failed to fetch image from API: {e}")
         photo_url = "https://i.postimg.cc/kX9tjGXP/16.png"
+
     buttons = [
         [
             InlineKeyboardButton("💎 Buy Premium", callback_data="buy_premium"),
@@ -293,19 +365,22 @@ async def send_start(client: Client, message: Message):
             InlineKeyboardButton('👨‍💻 Developers', callback_data="dev_info")
         ]
     ]
-    reply_markup = InlineKeyboardMarkup(buttons)
     bot = await client.get_me()
     await client.send_photo(
         chat_id=message.chat.id,
         photo=photo_url,
         caption=script.START_TXT.format(message.from_user.mention, bot.username, bot.first_name),
-        reply_markup=reply_markup,
+        reply_markup=InlineKeyboardMarkup(buttons),
         reply_to_message_id=message.id,
         parse_mode=enums.ParseMode.HTML
     )
 
 
-@Client.on_message(filters.command(["help"]))
+# ===========================================================================
+# /help  — private + group
+# ===========================================================================
+
+@Client.on_message(filters.command(["help"]) & (filters.private | filters.group))
 async def send_help(client: Client, message: Message):
     buttons = [[InlineKeyboardButton("❌ Close Menu", callback_data="close_btn")]]
     await client.send_message(
@@ -316,7 +391,11 @@ async def send_help(client: Client, message: Message):
     )
 
 
-@Client.on_message(filters.command(["plan", "myplan", "premium"]))
+# ===========================================================================
+# /plan  — private + group
+# ===========================================================================
+
+@Client.on_message(filters.command(["plan", "myplan", "premium"]) & (filters.private | filters.group))
 async def send_plan(client: Client, message: Message):
     buttons = [
         [InlineKeyboardButton("📸 Send Payment Proof", url="https://t.me/DmOwner")],
@@ -331,17 +410,51 @@ async def send_plan(client: Client, message: Message):
     )
 
 
-@Client.on_message(filters.command(["cancel"]))
+# ===========================================================================
+# /cancel  — private + group  (ported from Code 1)
+# ===========================================================================
+
+@Client.on_message(filters.command(["cancel"]) & (filters.private | filters.group))
 async def send_cancel(client: Client, message: Message):
-    batch_temp.IS_BATCH[message.from_user.id] = True
-    await message.reply_text("❌ Batch Process Cancelled Successfully.")
+    user_id  = message.from_user.id
+    chat_id  = message.chat.id
+    task_key = get_task_key(user_id, chat_id)
+
+    # If no task is running for this (user, chat) slot → nothing to cancel
+    if batch_temp.IS_BATCH.get(task_key, True) is True:
+        await client.send_message(
+            chat_id=message.chat.id,
+            text="<b>❌ No Active Process To Cancel.</b>",
+            reply_to_message_id=message.id,
+            parse_mode=enums.ParseMode.HTML
+        )
+        return
+
+    batch_temp.CANCEL_TASKS[task_key] = True
+    batch_temp.IS_BATCH[task_key]     = True
+
+    # Cancel in-flight download asyncio.Task if registered
+    task = batch_temp.DOWNLOAD_TASKS.get(task_key)
+    if task and not task.done():
+        task.cancel()
+
+    await client.send_message(
+        chat_id=message.chat.id,
+        text=(
+            "<b>🛑 Cancelling All Processes Immediately!</b>\n\n"
+            "⚠️ Stopping current download/upload…\n"
+            "⚠️ Cleaning up temporary files…"
+        ),
+        reply_to_message_id=message.id,
+        parse_mode=enums.ParseMode.HTML
+    )
 
 
-# =====================================================================
-# Additional feature commands — /setsleep and /getsleep
-# =====================================================================
+# ===========================================================================
+# /setsleep  — private + group
+# ===========================================================================
 
-@Client.on_message(filters.command(["setsleep"]) & filters.private)
+@Client.on_message(filters.command(["setsleep"]) & (filters.private | filters.group))
 async def set_sleep(client: Client, message: Message):
     try:
         parts = message.text.split()[1:]
@@ -356,7 +469,6 @@ async def set_sleep(client: Client, message: Message):
             return
 
         sleep_values = [int(x) for x in parts if x.isdigit() and 1 <= int(x) <= 1000]
-
         if not sleep_values:
             await message.reply("❌ Please provide valid sleep values between 1-1000 seconds!")
             return
@@ -372,7 +484,11 @@ async def set_sleep(client: Client, message: Message):
         await message.reply("❌ Please provide valid numeric values only!")
 
 
-@Client.on_message(filters.command(["getsleep"]) & filters.private)
+# ===========================================================================
+# /getsleep  — private + group
+# ===========================================================================
+
+@Client.on_message(filters.command(["getsleep"]) & (filters.private | filters.group))
 async def get_sleep(client: Client, message: Message):
     sleep_values = CUSTOM_SLEEP.get(message.from_user.id, [3, 5, 7, 10])
     await message.reply(
@@ -383,28 +499,29 @@ async def get_sleep(client: Client, message: Message):
     )
 
 
+# ===========================================================================
+# Settings panel helper
+# ===========================================================================
+
 async def settings_panel(client, callback_query):
-    """Renders the Settings Menu with professional layout."""
-    user_id = callback_query.from_user.id
+    user_id    = callback_query.from_user.id
     is_premium = await db.check_premium(user_id)
-    badge = "💎 Premium Member" if is_premium else "👤 Standard User"
+    badge      = "💎 Premium Member" if is_premium else "👤 Standard User"
 
     buttons = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📜 Command List", callback_data="cmd_list_btn")],
-        [InlineKeyboardButton("📊 Usage Stats", callback_data="user_stats_btn")],
+        [InlineKeyboardButton("📜 Command List",       callback_data="cmd_list_btn")],
+        [InlineKeyboardButton("📊 Usage Stats",        callback_data="user_stats_btn")],
         [InlineKeyboardButton("🗑 Dump Chat Settings", callback_data="dump_chat_btn")],
-        [InlineKeyboardButton("🖼 Manage Thumbnail", callback_data="thumb_btn")],
-        [InlineKeyboardButton("📝 Edit Caption", callback_data="caption_btn")],
-        [InlineKeyboardButton("⬅️ Return to Home", callback_data="start_btn")]
+        [InlineKeyboardButton("🖼 Manage Thumbnail",   callback_data="thumb_btn")],
+        [InlineKeyboardButton("📝 Edit Caption",       callback_data="caption_btn")],
+        [InlineKeyboardButton("⬅️ Return to Home",     callback_data="start_btn")]
     ])
-
     text = (
         f"<b>⚙️ Settings Dashboard</b>\n\n"
         f"<b>Account Status:</b> {badge}\n"
         f"<b>User ID:</b> <code>{user_id}</code>\n\n"
         f"<i>Customize and manage your bot preferences below for an optimized experience:</i>"
     )
-
     await callback_query.edit_message_caption(
         caption=text,
         reply_markup=buttons,
@@ -412,16 +529,22 @@ async def settings_panel(client, callback_query):
     )
 
 
-# =====================================================================
-# Main save handler — core logic UNTOUCHED
-# sleep between batch items replaced with smart_sleep from additional.py
-# =====================================================================
+# ===========================================================================
+# Main save handler — private + group
+# ===========================================================================
 
-@Client.on_message(filters.text & filters.private & ~filters.regex("^/"))
+@Client.on_message(filters.text & (filters.private | filters.group) & ~filters.regex("^/"))
 async def save(client: Client, message: Message):
-    if "https://t.me/" in message.text:
+    if "https://t.me/" not in message.text:
+        return
 
-        is_limit_reached = await db.check_limit(message.from_user.id)
+    user_id  = message.from_user.id
+    chat_id  = message.chat.id
+    task_key = get_task_key(user_id, chat_id)
+
+    # Limit check (skip in groups — limits are per-user in private chats)
+    if filters.private(None, message):
+        is_limit_reached = await db.check_limit(user_id)
         if is_limit_reached:
             btn = InlineKeyboardMarkup([[InlineKeyboardButton("💎 Upgrade to Premium", callback_data="buy_premium")]])
             return await message.reply_photo(
@@ -431,29 +554,48 @@ async def save(client: Client, message: Message):
                 parse_mode=enums.ParseMode.HTML
             )
 
-        if batch_temp.IS_BATCH.get(message.from_user.id) == False:
-            return await message.reply_text(
-                "<b>⚠️ A Task is Currently Processing.</b>\n"
-                "<i>Please wait for completion or use /cancel to stop.</i>",
-                parse_mode=enums.ParseMode.HTML
-            )
+    # Already processing?
+    if batch_temp.IS_BATCH.get(task_key, True) is False:
+        return await message.reply_text(
+            "<b>⚠️ A Task is Currently Processing.</b>\n"
+            "<i>Please wait for completion or use /cancel to stop.</i>",
+            parse_mode=enums.ParseMode.HTML
+        )
 
-        datas = message.text.split("/")
-        temp = datas[-1].replace("?single", "").split("-")
-        fromID = int(temp[0].strip())
-        try:
-            toID = int(temp[1].strip())
-        except:
-            toID = fromID
+    datas = message.text.split("/")
+    temp  = datas[-1].replace("?single", "").split("-")
+    fromID = int(temp[0].strip())
+    try:
+        toID = int(temp[1].strip())
+    except Exception:
+        toID = fromID
 
-        batch_temp.IS_BATCH[message.from_user.id] = False
-        is_private_link = "https://t.me/c/" in message.text
-        is_batch = "https://t.me/b/" in message.text
-        is_public_link = not is_private_link and not is_batch
+    # Mark slot as busy
+    batch_temp.IS_BATCH[task_key]     = False
+    batch_temp.CANCEL_TASKS[task_key] = False
 
+    total_items = toID - fromID + 1
+    completed   = 0
+
+    is_private_link = "https://t.me/c/" in message.text
+    is_batch_link   = "https://t.me/b/" in message.text
+    is_public_link  = not is_private_link and not is_batch_link
+
+    try:
         for msgid in range(fromID, toID + 1):
 
-            if batch_temp.IS_BATCH.get(message.from_user.id):
+            # ── Cancel check at top of every iteration ──────────────────
+            if batch_temp.CANCEL_TASKS.get(task_key, False):
+                await client.send_message(
+                    chat_id=message.chat.id,
+                    text=(
+                        f"<b>🛑 Batch Process Cancelled!</b>\n\n"
+                        f"✅ Completed: {completed}/{total_items} items\n"
+                        f"❌ Cancelled at message {msgid}/{toID}"
+                    ),
+                    reply_to_message_id=message.id,
+                    parse_mode=enums.ParseMode.HTML
+                )
                 break
 
             if is_public_link:
@@ -465,233 +607,461 @@ async def save(client: Client, message: Message):
                         message_id=msgid,
                         reply_to_message_id=message.id
                     )
-                    await db.add_traffic(message.from_user.id)
-                    # smart_sleep instead of fixed asyncio.sleep(1)
-                    await smart_sleep(message.from_user.id)
-                    continue
+                    await db.add_traffic(user_id)
+                    completed += 1
+                except Exception:
+                    pass
+            else:
+                # Private / restricted content needs a user session
+                user_data = await db.get_session(user_id)
+                if user_data is None:
+                    await message.reply(
+                        "<b>🔒 Authentication Required</b>\n\n"
+                        "<i>Use /login to securely authorize your account.</i>",
+                        parse_mode=enums.ParseMode.HTML
+                    )
+                    batch_temp.IS_BATCH[task_key] = True
+                    return
+
+                try:
+                    acc = Client(
+                        "saverestricted",
+                        session_string=user_data,
+                        api_hash=API_HASH,
+                        api_id=API_ID,
+                        in_memory=True,
+                        max_concurrent_transmissions=10
+                    )
+                    await acc.connect()
                 except Exception as e:
+                    batch_temp.IS_BATCH[task_key] = True
+                    return await message.reply(
+                        f"<b>❌ Authentication Failed</b>\n\n"
+                        f"<i>Your session may have expired. Please /logout and /login again.</i>\n"
+                        f"<code>{e}</code>",
+                        parse_mode=enums.ParseMode.HTML
+                    )
+
+                if is_private_link:
+                    chat_target = int("-100" + datas[4])
+                elif is_batch_link:
+                    chat_target = datas[4]
+                else:
+                    chat_target = datas[3]
+
+                try:
+                    success = await handle_restricted_content(
+                        client, acc, message, chat_target, msgid, task_key
+                    )
+                    if success:
+                        completed += 1
+                except ProcessCancelled:
+                    await client.send_message(
+                        chat_id=message.chat.id,
+                        text=(
+                            f"<b>🛑 Batch Process Cancelled!</b>\n\n"
+                            f"✅ Completed: {completed}/{total_items} items"
+                        ),
+                        reply_to_message_id=message.id,
+                        parse_mode=enums.ParseMode.HTML
+                    )
+                    break
+                except Exception as e:
+                    if ERROR_MESSAGE:
+                        await client.send_message(
+                            message.chat.id,
+                            f"Error: {e}",
+                            reply_to_message_id=message.id
+                        )
+
+            # ── Cancel check before sleep ────────────────────────────────
+            if batch_temp.CANCEL_TASKS.get(task_key, False):
+                break
+
+            if msgid < toID:
+                try:
+                    await smart_sleep(user_id)
+                except Exception:
                     pass
 
-            user_data = await db.get_session(message.from_user.id)
-            if user_data is None:
-                await message.reply(
-                    "<b>🔒 Authentication Required</b>\n\n"
-                    "<i>Access to this content requires login.</i>\n"
-                    "<i>Use /login to securely authorize your account.</i>",
-                    parse_mode=enums.ParseMode.HTML
-                )
-                batch_temp.IS_BATCH[message.from_user.id] = True
-                return
+            # Progress milestone every 5 files
+            if completed > 0 and completed % 5 == 0 and completed < total_items:
+                try:
+                    await client.send_message(
+                        message.chat.id,
+                        f"📊 Progress: {completed}/{total_items} completed…",
+                        reply_to_message_id=message.id
+                    )
+                except Exception:
+                    pass
 
+    except ProcessCancelled:
+        pass
+    except Exception as e:
+        logger.error(f"Error in batch process: {e}")
+    finally:
+        batch_temp.IS_BATCH[task_key]     = True
+        batch_temp.CANCEL_TASKS[task_key] = False
+        batch_temp.DOWNLOAD_TASKS.pop(task_key, None)
+
+        if completed > 0 and not batch_temp.CANCEL_TASKS.get(task_key, False):
             try:
-                acc = Client(
-                    "saverestricted",
-                    session_string=user_data,
-                    api_hash=API_HASH,
-                    api_id=API_ID,
-                    in_memory=True,
-                    max_concurrent_transmissions=10
-                )
-                await acc.connect()
-            except Exception as e:
-                batch_temp.IS_BATCH[message.from_user.id] = True
-                return await message.reply(
-                    f"<b>❌ Authentication Failed</b>\n\n"
-                    f"<i>Your session may have expired. Please /logout and /login again.</i>\n"
-                    f"<code>{e}</code>",
+                await client.send_message(
+                    message.chat.id,
+                    f"✅ <b>Batch Complete!</b>\n\nProcessed: {completed}/{total_items} items",
+                    reply_to_message_id=message.id,
                     parse_mode=enums.ParseMode.HTML
                 )
-
-            if is_private_link:
-                chatid = int("-100" + datas[4])
-                await handle_restricted_content(client, acc, message, chatid, msgid)
-            elif is_batch:
-                username = datas[4]
-                await handle_restricted_content(client, acc, message, username, msgid)
-            else:
-                username = datas[3]
-                await handle_restricted_content(client, acc, message, username, msgid)
-
-            # smart_sleep instead of fixed asyncio.sleep(2)
-            await smart_sleep(message.from_user.id)
-
-        batch_temp.IS_BATCH[message.from_user.id] = True
+            except Exception:
+                pass
 
 
-# =====================================================================
-# handle_restricted_content — core download/upload logic UNTOUCHED
-# Additional features (clean_filename, prefix/suffix, metadata,
-# permanent thumbnail) applied AFTER download, BEFORE upload
-# =====================================================================
+# ===========================================================================
+# handle_restricted_content
+# — Downloads, renames, adds metadata, then uploads.
+# — Uses async progress_callback with inline Cancel button.
+# — After download: edits status to "Adding Metadata…" before metadata step.
+# — After metadata:  edits status to "Uploading…" before upload step.
+# ===========================================================================
 
-async def handle_restricted_content(client: Client, acc, message: Message, chat_target, msgid):
+async def handle_restricted_content(
+    client: Client,
+    acc,
+    message: Message,
+    chat_target,
+    msgid: int,
+    task_key: str
+) -> bool:
+    """
+    Returns True on successful upload, False on skip/error.
+    Raises ProcessCancelled if the user cancels mid-way.
+    """
+    user_id = message.from_user.id
+
+    # ── Fetch source message ─────────────────────────────────────────────
     try:
         msg: Message = await acc.get_messages(chat_target, msgid)
     except Exception as e:
-        logger.error(f"Error fetching message: {e}")
-        return
+        logger.error(f"Error fetching message {msgid}: {e}")
+        return False
+
     if msg.empty:
-        return
+        return False
 
     msg_type = get_message_type(msg)
     if not msg_type:
-        return
+        return False
 
+    # ── File-size gate (free users) ──────────────────────────────────────
     file_size = 0
-    if msg_type == "Document": file_size = msg.document.file_size
-    elif msg_type == "Video": file_size = msg.video.file_size
-    elif msg_type == "Audio": file_size = msg.audio.file_size
+    if msg_type == "Document": file_size = getattr(msg.document, 'file_size', 0)
+    elif msg_type == "Video":  file_size = getattr(msg.video,    'file_size', 0)
+    elif msg_type == "Audio":  file_size = getattr(msg.audio,    'file_size', 0)
 
     if file_size > FREE_LIMIT_SIZE:
-        if not await db.check_premium(message.from_user.id):
-            btn = InlineKeyboardMarkup([[InlineKeyboardButton("💎 Upgrade to Premium", callback_data="buy_premium")]])
+        if not await db.check_premium(user_id):
+            btn = InlineKeyboardMarkup([[
+                InlineKeyboardButton("💎 Upgrade to Premium", callback_data="buy_premium")
+            ]])
             await client.send_message(
                 message.chat.id,
                 script.SIZE_LIMIT,
                 reply_markup=btn,
                 parse_mode=enums.ParseMode.HTML
             )
-            return
+            return False
 
+    # ── Text messages ────────────────────────────────────────────────────
     if msg_type == "Text":
         try:
-            await client.send_message(message.chat.id, msg.text, entities=msg.entities, parse_mode=enums.ParseMode.HTML)
-            return
-        except:
-            return
+            await client.send_message(
+                message.chat.id, msg.text,
+                entities=msg.entities,
+                parse_mode=enums.ParseMode.HTML
+            )
+            return True
+        except Exception:
+            return False
 
-    await db.add_traffic(message.from_user.id)
+    # ── Pre-download cancel check ────────────────────────────────────────
+    if batch_temp.CANCEL_TASKS.get(task_key, False):
+        raise ProcessCancelled("Cancelled before download")
+
+    await db.add_traffic(user_id)
+
+    cancel_markup = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🛑 Cancel", callback_data=f"cancel_{task_key}")
+    ]])
+
     smsg = await client.send_message(
         message.chat.id,
-        '<b>⬇️ Starting Download...</b>',
+        "<b>📥 Starting Download…</b>",
         reply_to_message_id=message.id,
+        reply_markup=cancel_markup,
         parse_mode=enums.ParseMode.HTML
     )
 
-    temp_dir = f"downloads/{message.id}"
-    if not os.path.exists(temp_dir):
-        os.makedirs(temp_dir)
+    temp_dir = f"downloads/{message.chat.id}_{message.id}_{msgid}"
+    os.makedirs(temp_dir, exist_ok=True)
 
-    # --- DOWNLOAD (core logic untouched) ---
+    file       = None
+    start_time = time.time()
+
+    # ── DOWNLOAD ─────────────────────────────────────────────────────────
     try:
-        asyncio.create_task(downstatus(client, f'{message.id}downstatus.txt', smsg, message.chat.id))
-
-        file = await acc.download_media(
-            msg,
-            file_name=f"{temp_dir}/",
-            progress=progress,
-            progress_args=[message, "down"]
+        dl_task = asyncio.create_task(
+            acc.download_media(
+                msg,
+                file_name=f"{temp_dir}/",
+                progress=progress_callback,
+                progress_args=(smsg, "download", start_time, task_key)
+            )
         )
+        batch_temp.DOWNLOAD_TASKS[task_key] = dl_task
 
-        if os.path.exists(f'{message.id}downstatus.txt'):
-            os.remove(f'{message.id}downstatus.txt')
+        try:
+            file = await dl_task
+        except asyncio.CancelledError:
+            raise ProcessCancelled("Download task cancelled")
+        finally:
+            batch_temp.DOWNLOAD_TASKS.pop(task_key, None)
+
+    except ProcessCancelled:
+        if file and os.path.exists(file):
+            try: os.remove(file)
+            except Exception: pass
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        try: await smsg.delete()
+        except Exception: pass
+        raise
 
     except Exception as e:
-        if batch_temp.IS_BATCH.get(message.from_user.id) or "Cancelled" in str(e):
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
-            return await smsg.edit("❌ **Task Cancelled**")
-        return await smsg.delete()
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        if "Cancelled" in str(e):
+            try: await smsg.edit("<b>❌ Task Cancelled</b>", parse_mode=enums.ParseMode.HTML)
+            except Exception: pass
+            raise ProcessCancelled(str(e))
+        try: await smsg.delete()
+        except Exception: pass
+        return False
 
-    # --- POST-DOWNLOAD: apply additional features before upload ---
+    # ── POST-DOWNLOAD cancel check ───────────────────────────────────────
+    if batch_temp.CANCEL_TASKS.get(task_key, False):
+        if file and os.path.exists(file):
+            try: os.remove(file)
+            except Exception: pass
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        try: await smsg.delete()
+        except Exception: pass
+        raise ProcessCancelled("Cancelled after download")
+
+    # ── Filename cleanup ─────────────────────────────────────────────────
     if file and os.path.exists(file):
-        old_filename = os.path.basename(file)
-        dir_name = os.path.dirname(file)
-
-        # 1. Clean filename (remove unwanted words)
-        cleaned = clean_filename(old_filename)
-        # 2. Apply prefix / suffix
+        old_filename   = os.path.basename(file)
+        dir_name       = os.path.dirname(file)
+        cleaned        = clean_filename(old_filename)
         final_filename = apply_prefix_suffix(cleaned)
 
         if old_filename != final_filename:
             new_path = os.path.join(dir_name, final_filename)
             os.rename(file, new_path)
             file = new_path
+    else:
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        try: await smsg.delete()
+        except Exception: pass
+        return False
 
-        # 3. Add metadata via ffmpeg (no-op if env vars not set)
-        file, _ = await add_metadata_with_ffmpeg(file, final_filename)
-
-    # --- UPLOAD (core logic untouched) ---
+    # ── METADATA — edit progress message to show "Adding Metadata…" ──────
     try:
-        asyncio.create_task(upstatus(client, f'{message.id}upstatus.txt', smsg, message.chat.id))
+        await smsg.edit_text(
+            "<b>🔧 Adding Metadata…</b>\n\n"
+            "<i>Processing file tags and stream info, please wait.</i>",
+            reply_markup=cancel_markup,
+            parse_mode=enums.ParseMode.HTML
+        )
+    except Exception:
+        pass
 
-        ph_path = None
+    if batch_temp.CANCEL_TASKS.get(task_key, False):
+        if file and os.path.exists(file):
+            try: os.remove(file)
+            except Exception: pass
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        try: await smsg.delete()
+        except Exception: pass
+        raise ProcessCancelled("Cancelled before metadata")
 
-        # 4. Permanent thumbnail (from additional.py) — overrides DB thumb if set
-        if PERMANENT_THUMBNAIL_URL:
-            ph_path = await download_thumbnail(PERMANENT_THUMBNAIL_URL)
+    file, _ = await add_metadata_with_ffmpeg(file, final_filename)
 
-        # Fall back to DB custom thumbnail if no permanent one
-        if not ph_path:
-            thumb_id = await db.get_thumbnail(message.from_user.id)
-            if thumb_id:
-                try:
-                    ph_path = await client.download_media(thumb_id, file_name=f"{temp_dir}/custom_thumb.jpg")
-                except Exception as e:
-                    logger.error(f"Failed to download custom thumb: {e}")
+    # ── POST-METADATA cancel check ───────────────────────────────────────
+    if batch_temp.CANCEL_TASKS.get(task_key, False):
+        if file and os.path.exists(file):
+            try: os.remove(file)
+            except Exception: pass
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        try: await smsg.delete()
+        except Exception: pass
+        raise ProcessCancelled("Cancelled after metadata")
 
-        # Fall back to original video/document thumbnail
-        if not ph_path:
+    # ── Edit progress message → "Uploading…" ─────────────────────────────
+    try:
+        await smsg.edit_text(
+            "<b>📤 Starting Upload…</b>",
+            reply_markup=cancel_markup,
+            parse_mode=enums.ParseMode.HTML
+        )
+    except Exception:
+        pass
+
+    # ── Thumbnail resolution (priority: permanent > DB > original) ───────
+    ph_path = None
+
+    if PERMANENT_THUMBNAIL_URL:
+        ph_path = await download_thumbnail(PERMANENT_THUMBNAIL_URL)
+
+    if not ph_path:
+        thumb_id = await db.get_thumbnail(user_id)
+        if thumb_id:
             try:
-                if msg_type == "Video" and msg.video.thumbs:
-                    ph_path = await acc.download_media(msg.video.thumbs[0].file_id, file_name=f"{temp_dir}/thumb.jpg")
-                elif msg_type == "Document" and msg.document.thumbs:
-                    ph_path = await acc.download_media(msg.document.thumbs[0].file_id, file_name=f"{temp_dir}/thumb.jpg")
-            except:
-                pass
+                ph_path = await client.download_media(
+                    thumb_id, file_name=f"{temp_dir}/custom_thumb.jpg"
+                )
+            except Exception as e:
+                logger.error(f"Failed to download custom thumb: {e}")
 
-        custom_caption = await db.get_caption(message.from_user.id)
-        if custom_caption:
-            final_caption = custom_caption.format(filename=file.split("/")[-1], size=humanbytes(file_size))
-        else:
-            final_caption = script.CAPTION.format(file_name=file.split("/")[-1])
-            if msg.caption:
-                final_caption += f"\n\n{msg.caption}"
-
-        if msg_type == "Document":
-            await client.send_document(
-                message.chat.id, file, thumb=ph_path, caption=final_caption,
-                progress=progress, progress_args=[message, "up"]
-            )
-        elif msg_type == "Video":
-            await client.send_video(
-                message.chat.id, file,
-                duration=msg.video.duration, width=msg.video.width, height=msg.video.height,
-                thumb=ph_path, caption=final_caption,
-                progress=progress, progress_args=[message, "up"]
-            )
-        elif msg_type == "Audio":
-            await client.send_audio(
-                message.chat.id, file, thumb=ph_path, caption=final_caption,
-                progress=progress, progress_args=[message, "up"]
-            )
-        elif msg_type == "Photo":
-            await client.send_photo(message.chat.id, file, caption=final_caption)
-
-    except Exception as e:
-        await smsg.edit(f"Upload Failed: {e}")
-
-    # Cleanup permanent thumbnail temp file
-    if ph_path and PERMANENT_THUMBNAIL_URL and os.path.exists(ph_path):
+    if not ph_path:
         try:
-            os.remove(ph_path)
-        except:
+            if msg_type == "Video" and msg.video.thumbs:
+                ph_path = await acc.download_media(
+                    msg.video.thumbs[0].file_id, file_name=f"{temp_dir}/thumb.jpg"
+                )
+            elif msg_type == "Document" and msg.document.thumbs:
+                ph_path = await acc.download_media(
+                    msg.document.thumbs[0].file_id, file_name=f"{temp_dir}/thumb.jpg"
+                )
+        except Exception:
             pass
 
-    if os.path.exists(f'{message.id}upstatus.txt'):
-        os.remove(f'{message.id}upstatus.txt')
+    # ── Caption ──────────────────────────────────────────────────────────
+    custom_caption = await db.get_caption(user_id)
+    if custom_caption:
+        final_caption = custom_caption.format(
+            filename=os.path.basename(file),
+            size=humanbytes(file_size)
+        )
+    else:
+        final_caption = script.CAPTION
+        if msg.caption:
+            final_caption += f"\n\n{msg.caption}"
+
+    # ── UPLOAD ───────────────────────────────────────────────────────────
+    upload_success = False
+    start_time     = time.time()
+
+    try:
+        if msg_type == "Document":
+            if batch_temp.CANCEL_TASKS.get(task_key, False):
+                raise ProcessCancelled("Cancelled before upload")
+            await client.send_document(
+                message.chat.id, file,
+                thumb=ph_path, caption=final_caption,
+                file_name=os.path.basename(file),
+                reply_to_message_id=message.id,
+                parse_mode=enums.ParseMode.HTML,
+                progress=progress_callback,
+                progress_args=(smsg, "upload", start_time, task_key)
+            )
+            upload_success = True
+
+        elif msg_type == "Video":
+            if batch_temp.CANCEL_TASKS.get(task_key, False):
+                raise ProcessCancelled("Cancelled before upload")
+            await client.send_video(
+                message.chat.id, file,
+                duration=msg.video.duration,
+                width=msg.video.width,
+                height=msg.video.height,
+                thumb=ph_path, caption=final_caption,
+                file_name=os.path.basename(file),
+                reply_to_message_id=message.id,
+                parse_mode=enums.ParseMode.HTML,
+                progress=progress_callback,
+                progress_args=(smsg, "upload", start_time, task_key)
+            )
+            upload_success = True
+
+        elif msg_type == "Audio":
+            if batch_temp.CANCEL_TASKS.get(task_key, False):
+                raise ProcessCancelled("Cancelled before upload")
+            await client.send_audio(
+                message.chat.id, file,
+                thumb=ph_path, caption=final_caption,
+                file_name=os.path.basename(file),
+                reply_to_message_id=message.id,
+                parse_mode=enums.ParseMode.HTML,
+                progress=progress_callback,
+                progress_args=(smsg, "upload", start_time, task_key)
+            )
+            upload_success = True
+
+        elif msg_type == "Photo":
+            if batch_temp.CANCEL_TASKS.get(task_key, False):
+                raise ProcessCancelled("Cancelled before upload")
+            await client.send_photo(
+                message.chat.id, file,
+                caption=final_caption,
+                reply_to_message_id=message.id,
+                parse_mode=enums.ParseMode.HTML
+            )
+            upload_success = True
+
+    except ProcessCancelled:
+        raise
+
+    except Exception as e:
+        if ERROR_MESSAGE:
+            await client.send_message(
+                message.chat.id,
+                f"Upload Failed: {e}",
+                reply_to_message_id=message.id
+            )
+
+    # ── Cleanup ──────────────────────────────────────────────────────────
+    if file and os.path.exists(file):
+        try: os.remove(file)
+        except Exception: pass
+
+    if ph_path and PERMANENT_THUMBNAIL_URL and os.path.exists(ph_path):
+        try: os.remove(ph_path)
+        except Exception: pass
+
     if os.path.exists(temp_dir):
-        shutil.rmtree(temp_dir)
-    await client.delete_messages(message.chat.id, [smsg.id])
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    try:
+        await client.delete_messages(message.chat.id, [smsg.id])
+    except Exception:
+        pass
+
+    return upload_success
 
 
-# =====================================================================
-# Callback query handler — untouched from Code 1
-# =====================================================================
+# ===========================================================================
+# Callback query handler
+# ===========================================================================
 
 @Client.on_callback_query()
 async def button_callbacks(client: Client, callback_query: CallbackQuery):
-    data = callback_query.data
+    # cancel_ callbacks are handled by the dedicated handler above;
+    # make sure we don't shadow them here.
+    data    = callback_query.data
     message = callback_query.message
     if not message:
         return
@@ -715,7 +1085,9 @@ async def button_callbacks(client: Client, callback_query: CallbackQuery):
             message_id=message.id,
             media=InputMediaPhoto(
                 media=SUBSCRIPTION,
-                caption=script.PREMIUM_TEXT.format(callback_query.from_user.mention, UPI_ID, QR_CODE)
+                caption=script.PREMIUM_TEXT.format(
+                    callback_query.from_user.mention, UPI_ID, QR_CODE
+                )
             ),
             reply_markup=InlineKeyboardMarkup(buttons)
         )
@@ -741,16 +1113,16 @@ async def button_callbacks(client: Client, callback_query: CallbackQuery):
         )
 
     elif data == "start_btn":
-        bot = await client.get_me()
+        bot  = await client.get_me()
         apis = ["https://api.waifu.pics/sfw/waifu", "https://nekos.life/api/v2/img/waifu"]
-        api_url = random.choice(apis)
         try:
-            response = requests.get(api_url)
+            response  = requests.get(random.choice(apis))
             response.raise_for_status()
             photo_url = response.json()["url"]
         except Exception as e:
             logger.error(f"Failed to fetch image from API: {e}")
             photo_url = "https://i.postimg.cc/cC7txyhz/15.png"
+
         buttons = [
             [
                 InlineKeyboardButton("💎 Buy Premium", callback_data="buy_premium"),
@@ -758,10 +1130,10 @@ async def button_callbacks(client: Client, callback_query: CallbackQuery):
             ],
             [
                 InlineKeyboardButton("⚙️ Settings Panel", callback_data="settings_btn"),
-                InlineKeyboardButton("ℹ️ About Bot", callback_data="about_btn")
+                InlineKeyboardButton("ℹ️ About Bot",       callback_data="about_btn")
             ],
             [
-                InlineKeyboardButton('📢 Channels', callback_data="channels_info"),
+                InlineKeyboardButton('📢 Channels',    callback_data="channels_info"),
                 InlineKeyboardButton('👨‍💻 Developers', callback_data="dev_info")
             ]
         ]
@@ -770,7 +1142,9 @@ async def button_callbacks(client: Client, callback_query: CallbackQuery):
             message_id=message.id,
             media=InputMediaPhoto(
                 media=photo_url,
-                caption=script.START_TXT.format(callback_query.from_user.mention, bot.username, bot.first_name)
+                caption=script.START_TXT.format(
+                    callback_query.from_user.mention, bot.username, bot.first_name
+                )
             ),
             reply_markup=InlineKeyboardMarkup(buttons)
         )
@@ -779,6 +1153,8 @@ async def button_callbacks(client: Client, callback_query: CallbackQuery):
         await message.delete()
 
     elif data in ["cmd_list_btn", "user_stats_btn", "dump_chat_btn", "thumb_btn", "caption_btn"]:
-        pass
+        pass   # placeholders — implement as needed
 
-    await callback_query.answer()
+    # Silently ignore cancel_ data here; handled by cancel_callback above
+    if not data.startswith("cancel_"):
+        await callback_query.answer()
