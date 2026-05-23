@@ -3,6 +3,7 @@ import datetime
 import sys
 import os
 from datetime import timezone, timedelta
+from aiohttp import web
 from pyrogram import Client, filters, enums, __version__ as pyrogram_version
 from pyrogram.types import Message, BotCommand
 from pyrogram.errors import FloodWait, RPCError
@@ -10,16 +11,9 @@ from config import API_ID, API_HASH, BOT_TOKEN, LOG_CHANNEL, ADMINS
 from database.db import db
 from logger import LOGGER
 
-# Keep-alive server (Render / Heroku)
-try:
-    from keep_alive import keep_alive
-except ImportError:
-    keep_alive = None
-
 logger = LOGGER(__name__)
 IST = timezone(timedelta(hours=5, minutes=30))
 
-# Small cache for your ~200 users to prevent DB lag
 USER_CACHE = set()
 
 LOGO = r"""
@@ -31,6 +25,23 @@ LOGO = r"""
     𝙱𝙾𝚃 𝚆𝙾𝚁𝙺𝙸𝙽𝙶 𝙿𝚁𝙾𝙿𝙴𝚁𝙻𝚈....
 """
 
+# ─── Health Check Server ────────────────────────────────────────────────────
+
+async def health_handler(request):
+    return web.Response(text="OK", status=200)
+
+async def start_health_server():
+    app = web.Application()
+    app.router.add_get("/", health_handler)
+    app.router.add_get("/health", health_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", 8080)
+    await site.start()
+    logger.info("Health check server running on port 8080")
+
+# ────────────────────────────────────────────────────────────────────────────
+
 class Bot(Client):
     def __init__(self):
         super().__init__(
@@ -39,38 +50,30 @@ class Bot(Client):
             api_hash=API_HASH,
             bot_token=BOT_TOKEN,
             plugins=dict(root="cantarella"),
-            workers=10, 
+            workers=10,
             sleep_threshold=15,
             max_concurrent_transmissions=5,
             ipv6=False,
             in_memory=False,
         )
-        self._keep_alive_started = False
 
     async def start(self):
         print(LOGO)
 
-        # 1. Start keep-alive BEFORE attempting Telegram login
-        if keep_alive and not self._keep_alive_started:
-            try:
-                loop = asyncio.get_running_loop()
-                try:
-                    keep_alive(loop)
-                except TypeError:
-                    keep_alive()
-                self._keep_alive_started = True
-                logger.info("Keep-alive server started.")
-            except Exception as e:
-                logger.warning(f"Keep-alive failed: {e}")
+        # 1. Start health check server on port 8080 for Koyeb
+        try:
+            await start_health_server()
+        except Exception as e:
+            logger.warning(f"Health server failed to start: {e}")
 
-        # 2. FIX FOR FLOOD WAIT: Resilient Login Loop
+        # 2. Resilient Login Loop with FloodWait handling
         while True:
             try:
                 await super().start()
-                break # Success!
+                break
             except FloodWait as e:
                 wait_time = int(e.value) + 10
-                logger.warning(f"FLOOD_WAIT detected during login. Sleeping for {wait_time}s...")
+                logger.warning(f"FLOOD_WAIT during login. Sleeping {wait_time}s...")
                 await asyncio.sleep(wait_time)
             except Exception as e:
                 logger.error(f"Critical Startup Error: {e}")
@@ -135,7 +138,9 @@ class Bot(Client):
         ]
         await self.set_bot_commands(commands)
 
+
 BotInstance = Bot()
+
 
 @BotInstance.on_message(filters.private & filters.incoming, group=-1)
 async def new_user_log(bot: Client, message: Message):
@@ -145,7 +150,7 @@ async def new_user_log(bot: Client, message: Message):
 
     if not await db.is_user_exist(user.id):
         await db.add_user(user.id, user.first_name)
-        
+
         now = datetime.datetime.now(IST)
         log_text = (
             f"<b>#NewUser 👤</b>\n"
@@ -157,8 +162,9 @@ async def new_user_log(bot: Client, message: Message):
             await bot.send_message(LOG_CHANNEL, log_text)
         except:
             pass
-    
+
     USER_CACHE.add(user.id)
+
 
 @BotInstance.on_message(filters.command("cmd") & filters.user(ADMINS))
 async def update_commands(bot: Client, message: Message):
@@ -167,6 +173,7 @@ async def update_commands(bot: Client, message: Message):
         await message.reply_text("✅ Commands menu updated!")
     except Exception as e:
         await message.reply_text(f"❌ Error: {e}")
+
 
 if __name__ == "__main__":
     BotInstance.run()
