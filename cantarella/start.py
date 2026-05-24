@@ -159,16 +159,6 @@ class script(object):
 <b>📸 QR Code:</b> <a href='{}'>Scan to Pay</a>
 <i>After Payment: Send Screenshot to Admin for Instant Activation.</i>
 """
-    PROGRESS_BAR = """\
-<b>⚡ Processing Task...</b>
-<blockquote>
-<b>Progress: {bar} {percentage:.1f}%</b>
-<b>🚀 Speed:</b> <code>{speed}/s</code>
-<b>💾 Size:</b> <code>{current} of {total}</code>
-<b>⏱ Elapsed:</b> <code>{elapsed}</code>
-<b>⏳ ETA:</b> <code>{eta}</code>
-</blockquote>
-"""
     CAPTION = """<b><a href="https://t.me/THEUPDATEDGUYS"></a></b>\n\n<b>⚜️ Powered By : <a href="https://t.me/THEUPDATEDGUYS">THE UPDATED GUYS 😎</a></b>"""
     LIMIT_REACHED = """<b>🚫 Daily Limit Exceeded</b>
 <b>Your 10 free saves for today have been used.</b>
@@ -192,7 +182,7 @@ def humanbytes(size):
         return "0B"
     power = 2 ** 10
     n = 0
-    Dic_powerN = {0: ' ', 1: 'K', 2: 'M', 3: 'G', 4: 'T'}
+    Dic_powerN = {0: ' ', 1: 'Ki', 2: 'Mi', 3: 'Gi', 4: 'Ti'}
     while size > power:
         size /= power
         n += 1
@@ -220,6 +210,18 @@ def get_message_type(msg):
     return None
 
 
+def make_progress_bar(percentage: float) -> str:
+    """
+    Builds a progress bar like: [■■■■■■▨□□□□□]
+    Total 12 slots. Filled = ■, partial tip = ▨, empty = □
+    """
+    total_slots = 12
+    filled = int(percentage / 100 * total_slots)
+    partial = 1 if filled < total_slots and percentage > 0 else 0
+    empty = total_slots - filled - partial
+    return "[" + "■" * filled + ("▨" if partial else "") + "□" * empty + "]"
+
+
 # ===========================================================================
 # Progress callback — async, inline edits the status message directly.
 # Attaches a 🛑 Cancel inline button carrying the task_key so it works in
@@ -228,7 +230,7 @@ def get_message_type(msg):
 
 UPDATE_DELAY = 5   # seconds between progress message edits
 
-async def progress_callback(current, total, smsg, mode, start_time, task_key):
+async def progress_callback(current, total, smsg, mode, start_time, task_key, file_name="", user_name=""):
     """
     Async progress callback compatible with pyrogram's download_media /
     send_* progress_args.
@@ -241,6 +243,8 @@ async def progress_callback(current, total, smsg, mode, start_time, task_key):
     mode      : "download" | "upload"
     start_time: time.time() when the transfer started
     task_key  : "user_id:chat_id" string for cancel checks
+    file_name : display name for the file
+    user_name : first name of the user who triggered the task
     """
     if smsg is None:
         return
@@ -259,23 +263,28 @@ async def progress_callback(current, total, smsg, mode, start_time, task_key):
     diff = now - start_time
     percentage = (current / total * 100) if total else 0
     speed = current / diff if diff > 0 else 0
-    eta = (total - current) / speed if speed > 0 else 0
+    eta_secs = (total - current) / speed if speed > 0 else 0
 
-    filled = int(percentage / 5)
-    bar = '█' * filled + ' ' * (20 - filled)
+    bar = make_progress_bar(percentage)
 
-    status_emoji = "📥" if mode == "download" else "📤"
-    status_label = "Downloading" if mode == "download" else "Uploading"
+    elapsed_str = TimeFormatter(int(diff * 1000))
+    eta_str = f"{int(eta_secs)}s" if eta_secs > 0 else "-"
+
+    display_name = file_name if file_name else "File"
+    status_label = "Download" if mode == "download" else "Upload"
+
+    # Use provided user_name; fall back to user_id from task_key
+    display_user = user_name if user_name else task_key.split(':')[0]
 
     text = (
-        f"<b>⚡ {status_emoji} {status_label}...</b>\n"
-        f"<blockquote>\n"
-        f"<b>Progress: [{bar}] {percentage:.1f}%</b>\n"
-        f"<b>🚀 Speed:</b> <code>{humanbytes(speed)}/s</code>\n"
-        f"<b>💾 Size:</b> <code>{humanbytes(current)} of {humanbytes(total)}</code>\n"
-        f"<b>⏱ Elapsed:</b> <code>{TimeFormatter(diff * 1000)}</code>\n"
-        f"<b>⏳ ETA:</b> <code>{TimeFormatter(eta * 1000)}</code>\n"
-        f"</blockquote>"
+        f"<b>{display_name}</b>\n"
+        f"┃ {bar} {percentage:.1f}%\n"
+        f"┠ Processed: {humanbytes(current)} of {humanbytes(total)}\n"
+        f"┠ Status: {status_label} | ETA: {eta_str}\n"
+        f"┠ Speed: {humanbytes(speed)}/s | Elapsed: {elapsed_str}\n"
+        f"┠ Engine: {'Aria2 v1.36.0' if mode == 'download' else 'PyroMulti v2.2.11'}\n"
+        f"┠ Mode:  #Leech | #{'Aria2' if mode == 'download' else 'TG'}\n"
+        f"┖ User: {display_user} | ID: {task_key.split(':')[0]}"
     )
 
     cancel_markup = InlineKeyboardMarkup([[
@@ -538,9 +547,10 @@ async def save(client: Client, message: Message):
     if "https://t.me/" not in message.text:
         return
 
-    user_id  = message.from_user.id
-    chat_id  = message.chat.id
-    task_key = get_task_key(user_id, chat_id)
+    user_id   = message.from_user.id
+    chat_id   = message.chat.id
+    task_key  = get_task_key(user_id, chat_id)
+    user_name = message.from_user.first_name or str(user_id)
 
     # Limit check (skip in groups — limits are per-user in private chats)
     if filters.private(None, message):
@@ -651,7 +661,7 @@ async def save(client: Client, message: Message):
 
                 try:
                     success = await handle_restricted_content(
-                        client, acc, message, chat_target, msgid, task_key
+                        client, acc, message, chat_target, msgid, task_key, user_name
                     )
                     if success:
                         completed += 1
@@ -730,13 +740,17 @@ async def handle_restricted_content(
     message: Message,
     chat_target,
     msgid: int,
-    task_key: str
+    task_key: str,
+    user_name: str = ""
 ) -> bool:
     """
     Returns True on successful upload, False on skip/error.
     Raises ProcessCancelled if the user cancels mid-way.
     """
     user_id = message.from_user.id
+
+    # Resolve display name for the user (first name takes priority)
+    display_user = user_name if user_name else (message.from_user.first_name or str(user_id))
 
     # ── Fetch source message ─────────────────────────────────────────────
     try:
@@ -789,13 +803,29 @@ async def handle_restricted_content(
 
     await db.add_traffic(user_id)
 
+    # ── Resolve display filename early for UI ────────────────────────────
+    display_name = "File"
+    if msg_type == "Document" and msg.document:
+        display_name = msg.document.file_name or "Document"
+    elif msg_type == "Video" and msg.video:
+        display_name = msg.video.file_name or "Video"
+    elif msg_type == "Audio" and msg.audio:
+        display_name = msg.audio.file_name or "Audio"
+
     cancel_markup = InlineKeyboardMarkup([[
         InlineKeyboardButton("🛑 Cancel", callback_data=f"cancel_{task_key}")
     ]])
 
     smsg = await client.send_message(
         message.chat.id,
-        "<b>📥 Starting Download…</b>",
+        f"<b>{display_name}</b>\n"
+        f"┃ [□□□□□□□□□□□□] 0.0%\n"
+        f"┠ Processed: 0 B of {humanbytes(file_size)}\n"
+        f"┠ Status: Download | ETA: -\n"
+        f"┠ Speed: 0.0 B/s | Elapsed: 0s\n"
+        f"┠ Engine: Aria2 v1.36.0\n"
+        f"┠ Mode:  #Leech | #Aria2\n"
+        f"┖ User: {display_user} | ID: {user_id}",
         reply_to_message_id=message.id,
         reply_markup=cancel_markup,
         parse_mode=enums.ParseMode.HTML
@@ -814,7 +844,7 @@ async def handle_restricted_content(
                 msg,
                 file_name=f"{temp_dir}/",
                 progress=progress_callback,
-                progress_args=(smsg, "download", start_time, task_key)
+                progress_args=(smsg, "download", start_time, task_key, display_name, display_user)
             )
         )
         batch_temp.DOWNLOAD_TASKS[task_key] = dl_task
@@ -876,11 +906,18 @@ async def handle_restricted_content(
         except Exception: pass
         return False
 
-    # ── METADATA — edit progress message to show "Adding Metadata…" ──────
+    # ── Resolve actual file size after download ──────────────────────────
+    actual_size = os.path.getsize(file) if file and os.path.exists(file) else file_size
+    size_str = humanbytes(actual_size)
+
+    # ── METADATA — edit progress message to show Metadata UI ─────────────
     try:
         await smsg.edit_text(
-            "<b>🔧 Adding Metadata…</b>\n\n"
-            "<i>Processing file tags and stream info, please wait.</i>",
+            f"<b>{final_filename}</b>\n"
+            f"┠ Status: Metadata\n"
+            f"┠ Size: {size_str}\n"
+            f"┠ Engine: ffmpeg v4.4.2-0\n"
+            f"┖ User: {display_user} | ID: {user_id}",
             reply_markup=cancel_markup,
             parse_mode=enums.ParseMode.HTML
         )
@@ -910,10 +947,17 @@ async def handle_restricted_content(
         except Exception: pass
         raise ProcessCancelled("Cancelled after metadata")
 
-    # ── Edit progress message → "Uploading…" ─────────────────────────────
+    # ── Edit progress message → Upload starting UI ────────────────────────
     try:
         await smsg.edit_text(
-            "<b>📤 Starting Upload…</b>",
+            f"<b>{final_filename}</b>\n"
+            f"┃ [□□□□□□□□□□□□] 0.0%\n"
+            f"┠ Processed: 0 B of {size_str}\n"
+            f"┠ Status: Upload | ETA: -\n"
+            f"┠ Speed: 0.0 B/s | Elapsed: 0s\n"
+            f"┠ Engine: PyroMulti v2.2.11\n"
+            f"┠ Mode:  #Leech | #Aria2\n"
+            f"┖ User: {display_user} | ID: {user_id}",
             reply_markup=cancel_markup,
             parse_mode=enums.ParseMode.HTML
         )
@@ -976,7 +1020,7 @@ async def handle_restricted_content(
                 reply_to_message_id=message.id,
                 parse_mode=enums.ParseMode.HTML,
                 progress=progress_callback,
-                progress_args=(smsg, "upload", start_time, task_key)
+                progress_args=(smsg, "upload", start_time, task_key, final_filename, display_user)
             )
             upload_success = True
 
@@ -993,7 +1037,7 @@ async def handle_restricted_content(
                 reply_to_message_id=message.id,
                 parse_mode=enums.ParseMode.HTML,
                 progress=progress_callback,
-                progress_args=(smsg, "upload", start_time, task_key)
+                progress_args=(smsg, "upload", start_time, task_key, final_filename, display_user)
             )
             upload_success = True
 
@@ -1007,7 +1051,7 @@ async def handle_restricted_content(
                 reply_to_message_id=message.id,
                 parse_mode=enums.ParseMode.HTML,
                 progress=progress_callback,
-                progress_args=(smsg, "upload", start_time, task_key)
+                progress_args=(smsg, "upload", start_time, task_key, final_filename, display_user)
             )
             upload_success = True
 
