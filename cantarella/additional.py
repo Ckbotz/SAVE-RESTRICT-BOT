@@ -26,7 +26,7 @@ WORDS_TO_REMOVE = [
 ]
 
 # Permanent thumbnail URL (leave empty string "" to disable)
-PERMANENT_THUMBNAIL_URL = "https://vault.pictures/media/images/9a/e6/8a/9ae68a30d698416290e220140cedecd5.jpg"
+PERMANENT_THUMBNAIL_URL = "https://imghost-bay.vercel.app/i/BQACAgUAAyEGAATP5GC2AAOVahXLZY7dZFBd2ZwVD0BwL2u9M3wAAsIeAAJXerFUehNK1jbpcKc7BA"
 
 # Prefix and Suffix settings
 FILE_PREFIX = os.environ.get("FILE_PREFIX", "").strip() or None
