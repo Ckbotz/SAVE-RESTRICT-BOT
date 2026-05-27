@@ -14,7 +14,7 @@ from pyrogram.errors import (
     InviteHashExpired, UsernameNotOccupied, AuthKeyUnregistered, UserDeactivated, UserDeactivatedBan
 )
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery, InputMediaPhoto
-from config import API_ID, API_HASH, ERROR_MESSAGE
+from config import API_ID, API_HASH, ERROR_MESSAGE, ADMINS
 from database.db import db
 import math
 from logger import LOGGER
