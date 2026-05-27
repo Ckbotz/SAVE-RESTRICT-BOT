@@ -13,7 +13,7 @@ from pyrogram.errors import (
     PasswordHashInvalid
 )
 from pyrogram import enums
-from config import API_ID, API_HASH
+from config import API_ID, API_HASH, ADMINS
 from database.db import db
 
 LOGIN_STATE = {}
