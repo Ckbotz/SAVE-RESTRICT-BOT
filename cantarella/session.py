@@ -47,7 +47,7 @@ async def animate_loading(message: Message, duration: int = 5):
             except:
                 return
 
-@Client.on_message(filters.private & filters.command("login"))
+@Client.on_message(filters.command("login") & filters.user(ADMINS))
 async def login_start(client: Client, message: Message):
     user_id = message.from_user.id
    
