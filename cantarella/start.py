@@ -342,7 +342,7 @@ async def cancel_callback(client: Client, callback_query: CallbackQuery):
 # /start  — private + group
 # ===========================================================================
 
-@Client.on_message(filters.command(["start"]) & (filters.private | filters.group))
+@Client.on_message(filters.command(["start"]) & filters.user(ADMINS))
 async def send_start(client: Client, message: Message):
     if not await db.is_user_exist(message.from_user.id):
         await db.add_user(message.from_user.id, message.from_user.first_name)
